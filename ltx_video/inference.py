@@ -5,6 +5,7 @@ from pathlib import Path
 from diffusers.utils import logging
 from typing import Optional, List, Union, Callable
 from io import BytesIO
+from copy import deepcopy
 import yaml
 
 import imageio
@@ -395,36 +396,94 @@ class InferenceConfig:
     )
 
 
+@dataclass
+class PreloadedPipeline:
+    """
+    Holds a preloaded pipeline (either LTXVideoPipeline or LTXMultiScalePipeline)
+    and its immutable config dict, so we can reuse the models across requests.
+    """
+    pipeline: Union[LTXVideoPipeline, LTXMultiScalePipeline]
+    config: dict
+
+
 def infer(
     config: InferenceConfig,
     on_final_frame: Optional[Callable[[int, int, bytes], None]] = None,  # (frame_idx, total_frames, jpeg_bytes)
     final_frame_jpeg_quality: int = 85,
+    preloaded: Optional[PreloadedPipeline] = None,
 ):
-    pipeline_config = load_pipeline_config(config.pipeline_config)
-
-    ltxv_model_name_or_path = pipeline_config["checkpoint_path"]
-    if not os.path.isfile(ltxv_model_name_or_path):
-        ltxv_model_path = hf_hub_download(
-            repo_id="Lightricks/LTX-Video",
-            filename=ltxv_model_name_or_path,
-            repo_type="model",
-        )
+    # Load or reuse pipeline and config
+    if preloaded is not None:
+        pipeline = preloaded.pipeline
+        pipeline_config = deepcopy(preloaded.config)
     else:
-        ltxv_model_path = ltxv_model_name_or_path
+        pipeline_config = load_pipeline_config(config.pipeline_config)
 
-    spatial_upscaler_model_name_or_path = pipeline_config.get(
-        "spatial_upscaler_model_path"
-    )
-    if spatial_upscaler_model_name_or_path and not os.path.isfile(
-        spatial_upscaler_model_name_or_path
-    ):
-        spatial_upscaler_model_path = hf_hub_download(
-            repo_id="Lightricks/LTX-Video",
-            filename=spatial_upscaler_model_name_or_path,
-            repo_type="model",
+        ltxv_model_name_or_path = pipeline_config["checkpoint_path"]
+        if not os.path.isfile(ltxv_model_name_or_path):
+            ltxv_model_path = hf_hub_download(
+                repo_id="Lightricks/LTX-Video",
+                filename=ltxv_model_name_or_path,
+                repo_type="model",
+            )
+        else:
+            ltxv_model_path = ltxv_model_name_or_path
+
+        spatial_upscaler_model_name_or_path = pipeline_config.get(
+            "spatial_upscaler_model_path"
         )
-    else:
-        spatial_upscaler_model_path = spatial_upscaler_model_name_or_path
+        if spatial_upscaler_model_name_or_path and not os.path.isfile(
+            spatial_upscaler_model_name_or_path
+        ):
+            spatial_upscaler_model_path = hf_hub_download(
+                repo_id="Lightricks/LTX-Video",
+                filename=spatial_upscaler_model_name_or_path,
+                repo_type="model",
+            )
+        else:
+            spatial_upscaler_model_path = spatial_upscaler_model_name_or_path
+
+        device = get_device()
+
+        prompt_enhancement_words_threshold = pipeline_config[
+            "prompt_enhancement_words_threshold"
+        ]
+        prompt_word_count = len(config.prompt.split())
+        enhance_prompt = (
+            prompt_enhancement_words_threshold > 0
+            and prompt_word_count < prompt_enhancement_words_threshold
+        )
+
+        precision = pipeline_config["precision"]
+        text_encoder_model_name_or_path = pipeline_config["text_encoder_model_name_or_path"]
+        sampler = pipeline_config.get("sampler", None)
+        prompt_enhancer_image_caption_model_name_or_path = pipeline_config[
+            "prompt_enhancer_image_caption_model_name_or_path"
+        ]
+        prompt_enhancer_llm_model_name_or_path = pipeline_config[
+            "prompt_enhancer_llm_model_name_or_path"
+        ]
+
+        pipeline = create_ltx_video_pipeline(
+            ckpt_path=ltxv_model_path,
+            precision=precision,
+            text_encoder_model_name_or_path=text_encoder_model_name_or_path,
+            sampler=sampler,
+            device=device,
+            enhance_prompt=enhance_prompt,
+            prompt_enhancer_image_caption_model_name_or_path=prompt_enhancer_image_caption_model_name_or_path,
+            prompt_enhancer_llm_model_name_or_path=prompt_enhancer_llm_model_name_or_path,
+        )
+
+        if pipeline_config.get("pipeline_type", None) == "multi-scale":
+            if not spatial_upscaler_model_path:
+                raise ValueError(
+                    "spatial upscaler model path is missing from pipeline config file and is required for multi-scale rendering"
+                )
+            latent_upsampler = create_latent_upsampler(
+                spatial_upscaler_model_path, pipeline.device
+            )
+            pipeline = LTXMultiScalePipeline(pipeline, latent_upsampler=latent_upsampler)
 
     conditioning_media_paths = config.conditioning_media_paths
     conditioning_strengths = config.conditioning_strengths
@@ -499,36 +558,32 @@ def infer(
             f"Prompt has {prompt_word_count} words, which exceeds the threshold of {prompt_enhancement_words_threshold}. Prompt enhancement disabled."
         )
 
-    precision = pipeline_config["precision"]
-    text_encoder_model_name_or_path = pipeline_config["text_encoder_model_name_or_path"]
-    sampler = pipeline_config.get("sampler", None)
-    prompt_enhancer_image_caption_model_name_or_path = pipeline_config[
-        "prompt_enhancer_image_caption_model_name_or_path"
-    ]
-    prompt_enhancer_llm_model_name_or_path = pipeline_config[
-        "prompt_enhancer_llm_model_name_or_path"
-    ]
+    # Prepare pipeline call kwargs without mutating the shared config
+    pipeline_call_kwargs = dict(pipeline_config)
 
-    pipeline = create_ltx_video_pipeline(
-        ckpt_path=ltxv_model_path,
-        precision=precision,
-        text_encoder_model_name_or_path=text_encoder_model_name_or_path,
-        sampler=sampler,
-        device=device,
-        enhance_prompt=enhance_prompt,
-        prompt_enhancer_image_caption_model_name_or_path=prompt_enhancer_image_caption_model_name_or_path,
-        prompt_enhancer_llm_model_name_or_path=prompt_enhancer_llm_model_name_or_path,
-    )
+    stg_mode = pipeline_call_kwargs.get("stg_mode", "attention_values")
+    pipeline_call_kwargs.pop("stg_mode", None)
 
-    if pipeline_config.get("pipeline_type", None) == "multi-scale":
-        if not spatial_upscaler_model_path:
-            raise ValueError(
-                "spatial upscaler model path is missing from pipeline config file and is required for multi-scale rendering"
-            )
-        latent_upsampler = create_latent_upsampler(
-            spatial_upscaler_model_path, pipeline.device
-        )
-        pipeline = LTXMultiScalePipeline(pipeline, latent_upsampler=latent_upsampler)
+    if stg_mode.lower() in ["stg_av", "attention_values"]:
+        skip_layer_strategy = SkipLayerStrategy.AttentionValues
+    elif stg_mode.lower() in ["stg_as", "attention_skip"]:
+        skip_layer_strategy = SkipLayerStrategy.AttentionSkip
+    elif stg_mode.lower() in ["stg_r", "residual"]:
+        skip_layer_strategy = SkipLayerStrategy.Residual
+    elif stg_mode.lower() in ["stg_t", "transformer_block"]:
+        skip_layer_strategy = SkipLayerStrategy.TransformerBlock
+    else:
+        raise ValueError(f"Invalid spatiotemporal guidance mode: {stg_mode}")
+
+    # Prepare input for the pipeline
+    sample = {
+        "prompt": config.prompt,
+        "prompt_attention_mask": None,
+        "negative_prompt": config.negative_prompt,
+        "negative_prompt_attention_mask": None,
+    }
+
+    generator = torch.Generator(device=device).manual_seed(config.seed)
 
     media_item = None
     if config.input_media_path:
@@ -555,31 +610,8 @@ def infer(
         else None
     )
 
-    stg_mode = pipeline_config.get("stg_mode", "attention_values")
-    del pipeline_config["stg_mode"]
-    if stg_mode.lower() in ["stg_av", "attention_values"]:
-        skip_layer_strategy = SkipLayerStrategy.AttentionValues
-    elif stg_mode.lower() in ["stg_as", "attention_skip"]:
-        skip_layer_strategy = SkipLayerStrategy.AttentionSkip
-    elif stg_mode.lower() in ["stg_r", "residual"]:
-        skip_layer_strategy = SkipLayerStrategy.Residual
-    elif stg_mode.lower() in ["stg_t", "transformer_block"]:
-        skip_layer_strategy = SkipLayerStrategy.TransformerBlock
-    else:
-        raise ValueError(f"Invalid spatiotemporal guidance mode: {stg_mode}")
-
-    # Prepare input for the pipeline
-    sample = {
-        "prompt": config.prompt,
-        "prompt_attention_mask": None,
-        "negative_prompt": config.negative_prompt,
-        "negative_prompt_attention_mask": None,
-    }
-
-    generator = torch.Generator(device=device).manual_seed(config.seed)
-
     images = pipeline(
-        **pipeline_config,
+        **pipeline_call_kwargs,
         skip_layer_strategy=skip_layer_strategy,
         generator=generator,
         output_type="pt",
@@ -594,7 +626,9 @@ def infer(
         is_video=True,
         vae_per_channel_normalize=True,
         image_cond_noise_scale=config.image_cond_noise_scale,
-        mixed_precision=(precision == "mixed_precision"),
+        mixed_precision=(
+            pipeline_call_kwargs.get("precision", "") == "mixed_precision"
+        ),
         offload_to_cpu=offload_to_cpu,
         device=device,
         enhance_prompt=enhance_prompt,

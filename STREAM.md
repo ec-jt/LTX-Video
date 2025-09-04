@@ -1,6 +1,6 @@
 #API server
 pip install fastapi uvicorn imageio imageio-ffmpeg pillow python-multipart
-UVICORN_WORKERS=1 uvicorn server:app --host 0.0.0.0 --port 8000
+LTXV_PRELOAD=configs/ltxv-2b-0.9.8-distilled.yaml UVICORN_WORKERS=1 uvicorn server:app --host 0.0.0.0 --port 8000
 
 #API request
 curl -N -X POST "http://localhost:8000/v1/frames" \
@@ -10,6 +10,6 @@ curl -N -X POST "http://localhost:8000/v1/frames" \
   -F "pipeline_config=configs/ltxv-2b-0.9.8-distilled.yaml" \
   --output - | hexdump -C | head
 
-#Browser index.html
-<img src="http://localhost:8000/v1/frames" style="max-width: 100%; background:#000" />
-
+#Browser streaming
+python -m http.server 8080 &
+http://localhost:8080
