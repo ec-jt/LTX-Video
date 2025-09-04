@@ -3,7 +3,8 @@ import random
 from datetime import datetime
 from pathlib import Path
 from diffusers.utils import logging
-from typing import Optional, List, Union
+from typing import Optional, List, Union, Callable
+from io import BytesIO
 import yaml
 
 import imageio
@@ -39,6 +40,14 @@ from ltx_video.models.autoencoders.latent_upsampler import LatentUpsampler
 import ltx_video.pipelines.crf_compressor as crf_compressor
 
 logger = logging.get_logger("LTX-Video")
+
+
+def _encode_jpeg_from_array(frame_np: np.ndarray, quality: int = 85) -> bytes:
+    """Encode an HxWxC uint8 array to JPEG bytes."""
+    pil = Image.fromarray(frame_np)
+    buf = BytesIO()
+    pil.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
 
 
 def get_total_gpu_memory():
@@ -386,7 +395,11 @@ class InferenceConfig:
     )
 
 
-def infer(config: InferenceConfig):
+def infer(
+    config: InferenceConfig,
+    on_final_frame: Optional[Callable[[int, int, bytes], None]] = None,  # (frame_idx, total_frames, jpeg_bytes)
+    final_frame_jpeg_quality: int = 85,
+):
     pipeline_config = load_pipeline_config(config.pipeline_config)
 
     ltxv_model_name_or_path = pipeline_config["checkpoint_path"]
@@ -419,7 +432,6 @@ def infer(config: InferenceConfig):
 
     # Validate conditioning arguments
     if conditioning_media_paths:
-        # Use default strengths of 1.0
         if not conditioning_strengths:
             conditioning_strengths = [1.0] * len(conditioning_media_paths)
         if not conditioning_start_frames:
@@ -545,13 +557,13 @@ def infer(config: InferenceConfig):
 
     stg_mode = pipeline_config.get("stg_mode", "attention_values")
     del pipeline_config["stg_mode"]
-    if stg_mode.lower() == "stg_av" or stg_mode.lower() == "attention_values":
+    if stg_mode.lower() in ["stg_av", "attention_values"]:
         skip_layer_strategy = SkipLayerStrategy.AttentionValues
-    elif stg_mode.lower() == "stg_as" or stg_mode.lower() == "attention_skip":
+    elif stg_mode.lower() in ["stg_as", "attention_skip"]:
         skip_layer_strategy = SkipLayerStrategy.AttentionSkip
-    elif stg_mode.lower() == "stg_r" or stg_mode.lower() == "residual":
+    elif stg_mode.lower() in ["stg_r", "residual"]:
         skip_layer_strategy = SkipLayerStrategy.Residual
-    elif stg_mode.lower() == "stg_t" or stg_mode.lower() == "transformer_block":
+    elif stg_mode.lower() in ["stg_t", "transformer_block"]:
         skip_layer_strategy = SkipLayerStrategy.TransformerBlock
     else:
         raise ValueError(f"Invalid spatiotemporal guidance mode: {stg_mode}")
@@ -571,7 +583,7 @@ def infer(config: InferenceConfig):
         skip_layer_strategy=skip_layer_strategy,
         generator=generator,
         output_type="pt",
-        callback_on_step_end=None,
+        callback_on_step_end=None,  # previews omitted for this endpoint
         height=height_padded,
         width=width_padded,
         num_frames=num_frames_padded,
@@ -598,14 +610,16 @@ def infer(config: InferenceConfig):
         pad_right = images.shape[4]
     images = images[:, :, : config.num_frames, pad_top:pad_bottom, pad_left:pad_right]
 
+    output_paths = []
+
     for i in range(images.shape[0]):
-        # Gathering from B, C, F, H, W to C, F, H, W and then permuting to F, H, W, C
+        # (B, C, F, H, W) -> (C, F, H, W) -> (F, H, W, C)
         video_np = images[i].permute(1, 2, 3, 0).cpu().float().numpy()
-        # Unnormalizing images to [0, 255] range
+        # Unnormalize to [0, 255]
         video_np = (video_np * 255).astype(np.uint8)
         fps = config.frame_rate
         height, width = video_np.shape[1:3]
-        # In case a single image is generated
+
         if video_np.shape[0] == 1:
             output_filename = get_unique_filename(
                 f"image_output_{i}",
@@ -616,6 +630,17 @@ def infer(config: InferenceConfig):
                 dir=output_dir,
             )
             imageio.imwrite(output_filename, video_np[0])
+            logger.warning(f"Output saved to {output_filename}")
+
+            # Fire single-frame callback if requested
+            if on_final_frame is not None:
+                try:
+                    jpeg = _encode_jpeg_from_array(video_np[0], quality=final_frame_jpeg_quality)
+                    on_final_frame(0, 1, jpeg)
+                except Exception:
+                    pass
+
+            output_paths.append(Path(output_filename))
         else:
             output_filename = get_unique_filename(
                 f"video_output_{i}",
@@ -626,12 +651,24 @@ def infer(config: InferenceConfig):
                 dir=output_dir,
             )
 
-            # Write video
+            # Write video and stream final frames as JPEGs
+            total_frames = int(video_np.shape[0])
             with imageio.get_writer(output_filename, fps=fps) as video:
-                for frame in video_np:
+                for idx, frame in enumerate(video_np):
+                    # Stream the final frame to the server (JPEG)
+                    if on_final_frame is not None:
+                        try:
+                            jpeg = _encode_jpeg_from_array(frame, quality=final_frame_jpeg_quality)
+                            on_final_frame(idx, total_frames, jpeg)
+                        except Exception:
+                            pass
+                    # Append raw frame to MP4 writer
                     video.append_data(frame)
 
-        logger.warning(f"Output saved to {output_filename}")
+            logger.warning(f"Output saved to {output_filename}")
+            output_paths.append(Path(output_filename))
+
+    return output_paths
 
 
 def prepare_conditioning(
