@@ -13,3 +13,5 @@ curl -N -X POST "http://localhost:8000/v1/frames" \
 #Browser streaming
 python -m http.server 8080 &
 http://localhost:8080
+
+#Edit index.html hostname if remote to view stream

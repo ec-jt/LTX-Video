@@ -4,7 +4,11 @@ import tempfile
 import shutil
 import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
+
+# Make tokenizers quiet & deterministic in a server
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
@@ -23,31 +27,37 @@ from ltx_video.inference import (
     get_device,
 )
 
-app = FastAPI(title="LTX-Video Frame Streaming API (Warm & Robust)", version="1.4")
+app = FastAPI(title="LTX-Video Frame Streaming API (Warm & Preloaded)", version="1.5")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],  # tighten in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# One generation at a time (raise cautiously if you have headroom)
+# Serialize GPU usage
 app.state.gen_sema = asyncio.Semaphore(1)
 
 BOUNDARY = "frame"  # multipart/x-mixed-replace boundary
 
+
 # --------------------------- Pipeline cache -----------------------------------
 
 class PipelineManager:
-    def __init__(self, max_cache: int = 2):
+    """
+    Keeps pipelines fully loaded across requests. Keyed by canonical config path (realpath).
+    Simple LRU; evictions move weights to CPU and clear VRAM.
+    """
+    def __init__(self, max_cache: int = 4):
         self.max_cache = max_cache
         self._lock = threading.RLock()
         self._cache: dict[str, PreloadedPipeline] = {}
-        self._lru: list[str] = []
+        self._lru: List[str] = []
 
     def _resolve_model_file(self, filename: str) -> str:
+        # Ensure we have a local file path (download once to HF cache if needed)
         if os.path.isabs(filename) and os.path.isfile(filename):
             return filename
         if os.path.isfile(filename):
@@ -56,16 +66,8 @@ class PipelineManager:
             repo_id="Lightricks/LTX-Video", filename=filename, repo_type="model"
         )
 
-    def get(self, pipeline_config_path: str) -> PreloadedPipeline:
-        key = os.path.abspath(pipeline_config_path)
-
-        with self._lock:
-            if key in self._cache:
-                self._lru.remove(key)
-                self._lru.append(key)
-                return self._cache[key]
-
-        cfg_dict = load_pipeline_config(key)
+    def _load_bundle(self, config_path: str) -> PreloadedPipeline:
+        cfg_dict = load_pipeline_config(config_path)
         device = get_device()
 
         ckpt = self._resolve_model_file(cfg_dict["checkpoint_path"])
@@ -73,13 +75,14 @@ class PipelineManager:
         if upsampler_path:
             upsampler_path = self._resolve_model_file(upsampler_path)
 
+        # Preload prompt enhancers if the config uses them
         preload_enhancers = cfg_dict.get("prompt_enhancement_words_threshold", 0) > 0
 
         pipeline = create_ltx_video_pipeline(
             ckpt_path=ckpt,
             precision=cfg_dict["precision"],
             text_encoder_model_name_or_path=cfg_dict["text_encoder_model_name_or_path"],
-            sampler=cfg_dict.get("sampler", None),
+            sampler=cfg_dict.get("sampler"),
             device=device,
             enhance_prompt=preload_enhancers,
             prompt_enhancer_image_caption_model_name_or_path=cfg_dict.get(
@@ -90,14 +93,27 @@ class PipelineManager:
             ),
         )
 
-        if cfg_dict.get("pipeline_type", None) == "multi-scale":
+        if cfg_dict.get("pipeline_type") == "multi-scale":
             if not upsampler_path:
                 raise ValueError("spatial_upscaler_model_path missing for multi-scale.")
             latent_upsampler = create_latent_upsampler(upsampler_path, device)
+            # Wrap (we import locally to avoid extra top-level import noise)
             from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline
             pipeline = LTXMultiScalePipeline(pipeline, latent_upsampler=latent_upsampler)
 
-        bundle = PreloadedPipeline(pipeline=pipeline, config=cfg_dict)
+        return PreloadedPipeline(pipeline=pipeline, config=cfg_dict)
+
+    def get(self, pipeline_config_path: str) -> PreloadedPipeline:
+        key = os.path.realpath(pipeline_config_path)
+        with self._lock:
+            if key in self._cache:
+                # LRU bump
+                self._lru.remove(key)
+                self._lru.append(key)
+                return self._cache[key]
+
+        # Load outside lock to avoid long lock hold
+        bundle = self._load_bundle(key)
 
         with self._lock:
             self._cache[key] = bundle
@@ -105,10 +121,12 @@ class PipelineManager:
                 self._lru.remove(key)
             self._lru.append(key)
 
+            # Evict if needed
             if len(self._lru) > self.max_cache:
                 evict_key = self._lru.pop(0)
                 ev = self._cache.pop(evict_key, None)
                 if ev is not None:
+                    # Move modules to CPU to free VRAM
                     p = ev.pipeline
                     try:
                         vp = getattr(p, "video_pipeline", p)
@@ -132,7 +150,34 @@ class PipelineManager:
 
         return bundle
 
-PIPELINES = PipelineManager(max_cache=2)
+PIPELINES = PipelineManager(max_cache=4)
+
+
+# --------------------------- Preload on startup -------------------------------
+
+def _parse_csv_env(name: str) -> List[str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+@app.on_event("startup")
+def _prewarm_pipelines():
+    """
+    Preload pipelines at process start so they don't load shards on first request.
+    Use env:
+      LTXV_PRELOAD="configs/ltxv-2b-0.9.8-distilled.yaml,configs/ltxv-13b-0.9.8-distilled.yaml"
+    """
+    configs = _parse_csv_env("LTXV_PRELOAD")
+    if not configs:
+        return
+    for cfg in configs:
+        try:
+            PIPELINES.get(cfg)
+        except Exception as e:
+            print(f"[preload] Failed to preload {cfg}: {e}")
+
 
 # --------------------------- upload utils -------------------------------------
 
@@ -209,9 +254,9 @@ async def stream_frames(queue: "asyncio.Queue[Optional[Tuple[int,int,bytes]]]",
                 await asyncio.sleep(1.0 / float(fps))
         yield f"--{BOUNDARY}--\r\n".encode("ascii")
     except asyncio.CancelledError:
-        # tell producer to stop caring
         client_gone.set()
         return
+
 
 # --------------------------- endpoints ----------------------------------------
 
@@ -234,10 +279,10 @@ async def generate_frames(
     image_cond_noise_scale: float = Form(0.15),
     realtime: bool = Form(True),
     jpeg_quality: int = Form(85),
-    buffer_all: bool = Form(True),   # buffer so we don't drop frames
+    buffer_all: bool = Form(True),   # buffer to avoid frame drops
 ):
     """
-    Streams FINAL frames as MJPEG using a warm pipeline and robust queueing.
+    Streams FINAL frames as MJPEG using a warm, preloaded pipeline.
     """
 
     # optional media
@@ -248,7 +293,7 @@ async def generate_frames(
         if input_media_path:
             tmp_dir_root = str(Path(input_media_path).parent)
 
-    # Queue: unbounded when buffer_all=True (prevents deadlock on client disconnect)
+    # Queue: unbounded when buffer_all=True (prevents deadlocks on client disconnect)
     queue_max = 0 if buffer_all else 1
     q: "asyncio.Queue[Optional[Tuple[int,int,bytes]]]" = asyncio.Queue(maxsize=queue_max)
     loop = asyncio.get_running_loop()
@@ -259,18 +304,19 @@ async def generate_frames(
         try:
             q.put_nowait(item)
         except asyncio.QueueFull:
-            # should not happen when maxsize=0, but safe if user disables buffer_all
+            # only if user disabled buffer_all and consumer is slow
             pass
 
     async def producer():
-        # keep GPU usage serialized
+        # Serialize generation to avoid VRAM thrash
         async with app.state.gen_sema:
             try:
+                # Get preloaded pipeline (loads once if not cached)
                 bundle = PIPELINES.get(pipeline_config)
 
                 cfg = InferenceConfig(
                     prompt=prompt,
-                    pipeline_config=pipeline_config,
+                    pipeline_config=pipeline_config,  # still used as metadata
                     seed=seed,
                     height=height,
                     width=width,
@@ -282,29 +328,26 @@ async def generate_frames(
                     image_cond_noise_scale=image_cond_noise_scale,
                 )
 
-                # non-blocking, safe enqueue from worker thread
                 def on_final_frame(frame_idx: int, total_frames: int, jpeg_bytes: bytes):
                     if client_gone.is_set():
-                        return  # stop enqueuing if client left
+                        return
                     loop.call_soon_threadsafe(_safe_put, (frame_idx, total_frames, jpeg_bytes))
 
-                # run inference without blocking the event loop
+                # Run generation without blocking the event loop
                 await loop.run_in_executor(
                     None,
                     lambda: infer(
                         cfg,
                         on_final_frame=on_final_frame,
                         final_frame_jpeg_quality=jpeg_quality,
-                        preloaded=bundle,
+                        preloaded=bundle,  # <-- reuse already-loaded modules
                     ),
                 )
 
             except Exception:
-                # On error, signal end (best effort)
                 loop.call_soon_threadsafe(_safe_put, None)
                 raise
             finally:
-                # Release semaphore (by leaving context) *then* signal end best-effort.
                 loop.call_soon_threadsafe(_safe_put, None)
                 if tmp_dir_root and os.path.isdir(tmp_dir_root):
                     shutil.rmtree(tmp_dir_root, ignore_errors=True)
